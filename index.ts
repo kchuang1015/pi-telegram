@@ -350,6 +350,51 @@ export default function (pi: ExtensionAPI) {
 		return data.result;
 	}
 
+	const PARSE_ERROR_PATTERNS = [
+		/can'?t parse entities/i,
+		/unsupported start tag/i,
+		/unsupported end tag/i,
+		/unsupported close tag/i,
+		/wrong closing tag/i,
+	] as const;
+
+	function isParseErrorMessage(message: string | undefined): boolean {
+		if (!message) return false;
+		return PARSE_ERROR_PATTERNS.some((re) => re.test(message));
+	}
+
+	// Try sendMessage with parse_mode=HTML; on entity-parse errors, retry once
+	// without parse_mode (plain text). On any other error (network, 4xx/5xx not
+	// related to parsing), propagate without retrying — Telegram may have
+	// already received the message, so blind retries can cause duplicates.
+	async function sendTextWithFallback(
+		chatId: number,
+		text: string,
+		options?: { signal?: AbortSignal; preferHtml?: boolean },
+	): Promise<TelegramSentMessage> {
+		const { signal, preferHtml = true } = options ?? {};
+		if (preferHtml) {
+			try {
+				return await callTelegram<TelegramSentMessage>(
+					"sendMessage",
+					{ chat_id: chatId, text, parse_mode: "HTML" },
+					{ signal },
+				);
+			} catch (err) {
+				const description = err instanceof Error ? err.message : String(err);
+				if (!isParseErrorMessage(description)) {
+					throw err;
+				}
+				// Fall through to plain-text retry.
+			}
+		}
+		return callTelegram<TelegramSentMessage>(
+			"sendMessage",
+			{ chat_id: chatId, text },
+			{ signal },
+		);
+	}
+
 	async function callTelegramMultipart<TResponse>(
 		method: string,
 		fields: Record<string, string>,
@@ -497,7 +542,7 @@ export default function (pi: ExtensionAPI) {
 			return false;
 		}
 		if (state.mode === "draft") {
-			await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: finalText });
+			await sendTextWithFallback(chatId, finalText);
 			await clearPreview(chatId);
 			return true;
 		}
@@ -509,10 +554,7 @@ export default function (pi: ExtensionAPI) {
 		const chunks = chunkParagraphs(text);
 		let lastMessageId: number | undefined;
 		for (const chunk of chunks) {
-			const sent = await callTelegram<TelegramSentMessage>("sendMessage", {
-				chat_id: chatId,
-				text: chunk,
-			});
+			const sent = await sendTextWithFallback(chatId, chunk);
 			lastMessageId = sent.message_id;
 		}
 		return lastMessageId;
@@ -1110,11 +1152,33 @@ export default function (pi: ExtensionAPI) {
 				await sendTextReply(turn.chatId, turn.replyToMessageId, "Attached requested file(s).");
 			}
 		} else {
-			await clearPreview(turn.chatId);
-			if (finalText) {
-				await sendTextReply(turn.chatId, turn.replyToMessageId, finalText);
-			} else if (turn.queuedAttachments.length > 0) {
-				await sendTextReply(turn.chatId, turn.replyToMessageId, "Attached requested file(s).");
+			// Long-message path: clear preview AFTER sending, so that if every
+			// chunk fails irrecoverably the streamed draft remains visible
+			// instead of vanishing with no replacement.
+			let sentOk = false;
+			try {
+				if (finalText) {
+					await sendTextReply(turn.chatId, turn.replyToMessageId, finalText);
+				} else if (turn.queuedAttachments.length > 0) {
+					await sendTextReply(turn.chatId, turn.replyToMessageId, "Attached requested file(s).");
+				}
+				sentOk = true;
+			} catch (err) {
+				console.error("pi-telegram: sendTextReply failed, keeping preview", err);
+			}
+			if (sentOk) {
+				await clearPreview(turn.chatId);
+			} else {
+				// Fall back to a plain-text failure notice so the user is not
+				// left guessing why the streamed draft never became a message.
+				try {
+					await sendTextWithFallback(turn.chatId, "[Telegram bridge: failed to deliver final message]", {
+						preferHtml: false,
+					});
+					await clearPreview(turn.chatId);
+				} catch (innerErr) {
+					console.error("pi-telegram: failure notice also failed", innerErr);
+				}
 			}
 		}
 
