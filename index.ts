@@ -363,22 +363,41 @@ export default function (pi: ExtensionAPI) {
 		return PARSE_ERROR_PATTERNS.some((re) => re.test(message));
 	}
 
-	// Try sendMessage with parse_mode=HTML; on entity-parse errors, retry once
-	// without parse_mode (plain text). On any other error (network, 4xx/5xx not
+	// Prefer Telegram-native Rich Markdown, then HTML/plain text on explicit
+	// format rejection or unsupported method. On other errors (network, 4xx/5xx not
 	// related to parsing), propagate without retrying — Telegram may have
 	// already received the message, so blind retries can cause duplicates.
 	async function sendTextWithFallback(
 		chatId: number,
 		text: string,
-		options?: { signal?: AbortSignal; preferHtml?: boolean },
+		options?: { signal?: AbortSignal; preferHtml?: boolean; messageId?: number },
 	): Promise<TelegramSentMessage> {
-		const { signal, preferHtml = true } = options ?? {};
+		const { signal, preferHtml = true, messageId } = options ?? {};
+		const method = messageId === undefined ? "sendMessage" : "editMessageText";
+		const target = { chat_id: chatId, ...(messageId === undefined ? {} : { message_id: messageId }) };
+		const request = async (apiMethod: string, payload: Record<string, unknown>): Promise<TelegramSentMessage> => {
+			try {
+				return await callTelegram<TelegramSentMessage>(apiMethod, payload, { signal });
+			} catch (err) {
+				const description = err instanceof Error ? err.message : String(err);
+				if (messageId !== undefined && /message is not modified/i.test(description)) return { message_id: messageId };
+				throw err;
+			}
+		};
 		if (preferHtml) {
 			try {
-				return await callTelegram<TelegramSentMessage>(
-					"sendMessage",
-					{ chat_id: chatId, text, parse_mode: "HTML" },
-					{ signal },
+				return await request(
+					messageId === undefined ? "sendRichMessage" : "editMessageText",
+					{ ...target, rich_message: { markdown: text }, ...(messageId === undefined ? { allow_paid_broadcast: false } : {}) },
+				);
+			} catch (err) {
+				const description = err instanceof Error ? err.message : String(err);
+				if (!isParseErrorMessage(description) && description !== "Not Found") throw err;
+			}
+			try {
+				return await request(
+					method,
+					{ ...target, text, parse_mode: "HTML" },
 				);
 			} catch (err) {
 				const description = err instanceof Error ? err.message : String(err);
@@ -388,10 +407,9 @@ export default function (pi: ExtensionAPI) {
 				// Fall through to plain-text retry.
 			}
 		}
-		return callTelegram<TelegramSentMessage>(
-			"sendMessage",
-			{ chat_id: chatId, text },
-			{ signal },
+		return request(
+			method,
+			{ ...target, text },
 		);
 	}
 
@@ -503,7 +521,15 @@ export default function (pi: ExtensionAPI) {
 			const draftId = state.draftId ?? allocateDraftId();
 			state.draftId = draftId;
 			try {
-				await callTelegram("sendMessageDraft", { chat_id: chatId, draft_id: draftId, text: truncated });
+				try {
+					await callTelegram("sendRichMessageDraft", {
+						chat_id: chatId, draft_id: draftId, rich_message: { markdown: truncated },
+					});
+				} catch (err) {
+					const description = err instanceof Error ? err.message : String(err);
+					if (!isParseErrorMessage(description) && description !== "Not Found") throw err;
+					await callTelegram("sendMessageDraft", { chat_id: chatId, draft_id: draftId, text: truncated });
+				}
 				draftSupport = "supported";
 				state.mode = "draft";
 				state.lastSentText = truncated;
@@ -545,6 +571,14 @@ export default function (pi: ExtensionAPI) {
 			await sendTextWithFallback(chatId, finalText);
 			await clearPreview(chatId);
 			return true;
+		}
+		if (state.messageId !== undefined) {
+			try {
+				await sendTextWithFallback(chatId, finalText, { messageId: state.messageId });
+			} catch {
+				// The persistent preview is already delivered; formatting is optional.
+				console.warn("pi-telegram: preview formatting failed, keeping delivered message");
+			}
 		}
 		previewState = undefined;
 		return state.messageId !== undefined;
