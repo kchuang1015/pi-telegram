@@ -326,7 +326,8 @@ export default function (pi: ExtensionAPI) {
 	let nextDraftId = 0;
 	const mediaGroups = new Map<string, TelegramMediaGroupState>();
 	/** Set when a session switch should keep the Telegram bridge polling. */
-	let shouldResumePolling = false;	/** Telegram message to reply to once a session switch completes. */
+	let shouldResumePolling = false;
+	/** Telegram message to reply to once a session switch completes. */
 	let pendingSessionReply: { chatId: number; messageId: number } | undefined;
 	/** Sessions offered for selection by /resume. */
 	let pendingSessionChoices: SessionChoice[] | undefined;
