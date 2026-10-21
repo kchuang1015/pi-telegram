@@ -157,6 +157,7 @@ test("the telegram-new command starts a new session and reports back", async () 
 		await waitFor(() => h.sent.length === 1);
 		await h.commands["telegram-new"].handler("", h.ctx);
 		assert.equal(h.newSessionCalls.length, 1);
+		assert.equal(h.newSessionCalls[0].parentSession, "/current.json", "the previous session is recorded as parent");
 		await waitFor(() => sentText(h.calls).includes("Started a new session"));
 	} finally {
 		await h.handlers.session_shutdown({}, h.ctx);

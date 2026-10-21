@@ -1190,7 +1190,9 @@ export default function (pi: ExtensionAPI) {
 			const reply = pendingSessionReply;
 			pendingSessionReply = undefined;
 			pendingSessionChoices = undefined;
+			const parentSession = ctx.sessionManager.getSessionFile();
 			const result = await ctx.newSession({
+				parentSession,
 				withSession: async () => {
 					if (reply) {
 						await sendTextReply(reply.chatId, reply.messageId, "Started a new session. The bridge stays connected.");
