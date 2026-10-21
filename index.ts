@@ -14,6 +14,8 @@ interface TelegramConfig {
 	botId?: number;
 	allowedUserId?: number;
 	lastUpdateId?: number;
+	/** Set before a session switch so the bridge can resume polling afterwards. */
+	reconnectAfterSessionSwitch?: boolean;
 }
 
 interface TelegramApiResponse<T> {
@@ -324,8 +326,7 @@ export default function (pi: ExtensionAPI) {
 	let nextDraftId = 0;
 	const mediaGroups = new Map<string, TelegramMediaGroupState>();
 	/** Set when a session switch should keep the Telegram bridge polling. */
-	let shouldResumePolling = false;
-	/** Telegram message to reply to once a session switch completes. */
+	let shouldResumePolling = false;	/** Telegram message to reply to once a session switch completes. */
 	let pendingSessionReply: { chatId: number; messageId: number } | undefined;
 	/** Sessions offered for selection by /resume. */
 	let pendingSessionChoices: SessionChoice[] | undefined;
@@ -1191,6 +1192,10 @@ export default function (pi: ExtensionAPI) {
 			pendingSessionReply = undefined;
 			pendingSessionChoices = undefined;
 			const parentSession = ctx.sessionManager.getSessionFile();
+			// Persist the reconnect intent so the bridge comes back after the switch.
+			config = await readConfig();
+			config.reconnectAfterSessionSwitch = true;
+			await writeConfig(config);
 			const result = await ctx.newSession({
 				parentSession,
 				withSession: async () => {
@@ -1199,8 +1204,12 @@ export default function (pi: ExtensionAPI) {
 					}
 				},
 			});
-			if (result.cancelled && reply) {
-				await sendTextReply(reply.chatId, reply.messageId, "Session switch was cancelled.");
+			if (result.cancelled) {
+				config.reconnectAfterSessionSwitch = false;
+				await writeConfig(config);
+				if (reply) {
+					await sendTextReply(reply.chatId, reply.messageId, "Session switch was cancelled.");
+				}
 			}
 		},
 	});
@@ -1220,6 +1229,9 @@ export default function (pi: ExtensionAPI) {
 			}
 			pendingSessionReply = undefined;
 			pendingSessionChoices = undefined;
+			config = await readConfig();
+			config.reconnectAfterSessionSwitch = true;
+			await writeConfig(config);
 			const result = await ctx.switchSession(choice.path, {
 				withSession: async () => {
 					if (reply) {
@@ -1227,8 +1239,12 @@ export default function (pi: ExtensionAPI) {
 					}
 				},
 			});
-			if (result.cancelled && reply) {
-				await sendTextReply(reply.chatId, reply.messageId, "Session switch was cancelled.");
+			if (result.cancelled) {
+				config.reconnectAfterSessionSwitch = false;
+				await writeConfig(config);
+				if (reply) {
+					await sendTextReply(reply.chatId, reply.messageId, "Session switch was cancelled.");
+				}
 			}
 		},
 	});
@@ -1237,8 +1253,13 @@ export default function (pi: ExtensionAPI) {
 		config = await readConfig();
 		await mkdir(TEMP_DIR, { recursive: true });
 		updateStatus(ctx);
-		if (shouldResumePolling) {
+		// The reconnect intent is persisted in the config file: in-memory state does not
+		// survive a session replacement or an extension reload. The in-memory flag is
+		// only a fallback for the case where writing the config failed.
+		if (config.reconnectAfterSessionSwitch === true || shouldResumePolling) {
+			config.reconnectAfterSessionSwitch = false;
 			shouldResumePolling = false;
+			await writeConfig(config);
 			await startPolling(ctx);
 		}
 	});

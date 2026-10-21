@@ -129,8 +129,8 @@ const message = (id, text) => ({ message_id: id, chat: { id: 7, type: "private" 
 
 const sentText = (calls) =>
 	calls
-		.filter((c) => c.method === "sendMessage" || c.method === "editMessageText")
-		.map((c) => c.body.text)
+		.filter((c) => ["sendMessage", "editMessageText", "sendRichMessage"].includes(c.method))
+		.map((c) => c.body.text ?? c.body.rich_message?.markdown ?? "")
 		.join("\n");
 
 test("Telegram /new dispatches the session command instead of forwarding a prompt", async () => {
@@ -234,6 +234,21 @@ test("the bridge resumes polling after a session switch", async () => {
 			h.calls.filter((c) => c.method === "getUpdates").length > before,
 			"polling must resume after the session was replaced",
 		);
+	} finally {
+		await h.handlers.session_shutdown({}, h.ctx);
+		await h.cleanup();
+	}
+});
+
+test("the reconnect intent is persisted in the config file, not only in memory", async () => {
+	const h = await setup();
+	try {
+		await h.connect();
+		h.setUpdates([{ update_id: 1, message: message(1, "/new") }]);
+		await waitFor(() => h.sent.length === 1);
+		await h.commands["telegram-new"].handler("", h.ctx);
+		const config = JSON.parse(await readFile(join(h.home, ".pi", "agent", "telegram.json"), "utf8"));
+		assert.equal(config.reconnectAfterSessionSwitch, true, "the intent must survive in the config file");
 	} finally {
 		await h.handlers.session_shutdown({}, h.ctx);
 		await h.cleanup();
