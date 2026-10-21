@@ -129,7 +129,9 @@ In Telegram, send:
 /new
 ```
 
-This starts a fresh pi session and keeps the Telegram bridge connected.
+This starts a fresh pi session and keeps the Telegram bridge connected. The previous session is recorded as the parent of the new one, so the session history stays linked.
+
+The switch happens inside the running pi process; pi does not have to be restarted.
 
 ### Switch to a previous session
 
