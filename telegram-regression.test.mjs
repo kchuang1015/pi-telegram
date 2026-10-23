@@ -254,3 +254,97 @@ test("the reconnect intent is persisted in the config file, not only in memory",
 		await h.cleanup();
 	}
 });
+
+/** Drive one full Telegram turn: prompt -> agent_start -> streaming text -> agent_end. */
+async function runTurn(h, text) {
+	h.setUpdates([{ update_id: 10, message: message(10, text) }]);
+	await waitFor(() => h.sent.length > 0);
+	await h.handlers.agent_start({}, h.ctx);
+	await h.handlers.message_update({ message: { role: "assistant", content: [{ type: "text", text }] } }, h.ctx);
+	await h.handlers.agent_end(
+		{ messages: [{ role: "assistant", content: [{ type: "text", text }], stopReason: "stop" }] },
+		h.ctx,
+	);
+	await waitFor(() => h.calls.some((c) => ["sendMessage", "sendRichMessage"].includes(c.method)));
+}
+
+test("markdown is converted to Telegram HTML, with tables as aligned monospace blocks", async () => {
+	const { markdownToTelegramHtml } = await import("./index.ts?unit=" + Math.random());
+	const html = markdownToTelegramHtml(["| 項目 | 狀態 |", "| --- | --- |", "| pi | 1.4.0 |"].join("\n"));
+	assert.match(html, /<pre>/, "tables must degrade to a monospace block");
+	assert.match(html, /pi/);
+	assert.match(html, /1\.4\.0/);
+	assert.ok(!html.includes("|"), "the pipe characters must not survive as raw text");
+
+	assert.equal(markdownToTelegramHtml("**粗體**"), "<b>粗體</b>");
+	assert.equal(markdownToTelegramHtml("`code`"), "<code>code</code>");
+	assert.equal(markdownToTelegramHtml("a < b & c"), "a &lt; b &amp; c", "HTML specials must be escaped");
+	assert.match(markdownToTelegramHtml("```sh\nls\n```"), /<pre><code class="language-sh">ls<\/code><\/pre>/);
+});
+
+test("replies use rich messages by default", async () => {
+	const h = await setup();
+	try {
+		await h.connect();
+		await runTurn(h, "**hello**");
+		const rich = h.calls.filter((c) => c.method === "sendRichMessage");
+		assert.equal(rich.length, 1, "the final reply must go out as a rich message");
+		assert.equal(rich[0].body.rich_message.markdown, "**hello**");
+	} finally {
+		await h.handlers.session_shutdown({}, h.ctx);
+		await h.cleanup();
+	}
+});
+
+test("Telegram /plain switches to the compatibility path and persists the setting", async () => {
+	const h = await setup();
+	try {
+		await h.connect();
+		h.setUpdates([{ update_id: 1, message: message(1, "/plain") }]);
+		await waitFor(() => sentText(h.calls).includes("相容模式"));
+		const config = JSON.parse(await readFile(join(h.home, ".pi", "agent", "telegram.json"), "utf8"));
+		assert.equal(config.richMessages, false, "the compat mode must be persisted in the config file");
+
+		await runTurn(h, "**hello**");
+		assert.equal(h.calls.filter((c) => c.method === "sendRichMessage").length, 0, "no rich message may be sent in compat mode");
+		const plain = h.calls.filter((c) => c.method === "sendMessage" && c.body.parse_mode === "HTML" && c.body.text === "<b>hello</b>");
+		assert.equal(plain.length, 1, "the final reply must go out as HTML instead");
+	} finally {
+		await h.handlers.session_shutdown({}, h.ctx);
+		await h.cleanup();
+	}
+});
+
+test("Telegram /rich switches back to rich messages", async () => {
+	const h = await setup();
+	try {
+		await h.connect();
+		h.setUpdates([{ update_id: 1, message: message(1, "/plain") }]);
+		await waitFor(() => sentText(h.calls).includes("相容模式"));
+		h.setUpdates([{ update_id: 2, message: message(2, "/rich") }]);
+		await waitFor(() => sentText(h.calls).includes("Rich 模式"));
+		const config = JSON.parse(await readFile(join(h.home, ".pi", "agent", "telegram.json"), "utf8"));
+		assert.equal(config.richMessages, true);
+
+		const richBefore = h.calls.filter((c) => c.method === "sendRichMessage").length;
+		await runTurn(h, "**hello**");
+		const richAfter = h.calls.filter((c) => c.method === "sendRichMessage").length;
+		assert.equal(richAfter - richBefore, 1, "rich messages must be used again");
+	} finally {
+		await h.handlers.session_shutdown({}, h.ctx);
+		await h.cleanup();
+	}
+});
+
+test("streamed previews never use rich drafts", async () => {
+	const h = await setup();
+	try {
+		await h.connect();
+		await runTurn(h, "**hello**");
+		const drafts = h.calls.filter((c) => c.method === "sendRichMessageDraft");
+		assert.equal(drafts.length, 0, "streamed previews must stay on the plain path");
+	} finally {
+		await h.handlers.session_shutdown({}, h.ctx);
+		await h.cleanup();
+	}
+});

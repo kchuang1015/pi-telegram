@@ -150,6 +150,30 @@ The bridge replies with the most recent sessions for the current working directo
 
 Session switches triggered from Telegram keep the bridge polling, so the bot stays reachable in the new session.
 
+### Switch between rich and compatibility formatting
+
+Replies are sent with `sendRichMessage` (Bot API 10.1 rich markdown), which renders native tables,
+headings and collapsible sections. Telegram Web has known rendering bugs with rich messages
+(they can show up as an unsupported-message placeholder, or break the chat list until the page is
+reloaded), so the format can be switched per chat:
+
+```text
+/plain
+```
+
+switches to compatibility mode: replies go out with `sendMessage` plus `parse_mode=HTML`, and
+markdown tables degrade to an aligned monospace block. Every client renders that reliably.
+
+```text
+/rich
+```
+
+switches back to rich messages.
+
+The setting is persisted in `~/.pi/agent/telegram.json` as `richMessages` (`false` means
+compatibility mode) and can also be edited there directly. Streamed previews always use the plain
+path, so only one rich message per reply is sent.
+
 ## Streaming
 
 The extension streams assistant text previews back to Telegram while pi is generating.
@@ -163,6 +187,7 @@ It tries Telegram draft streaming first with `sendMessageDraft`. If that is not 
 - Long replies are split below Telegram's 4096 character limit
 - Outbound files are sent via `telegram_attach`
 - `/new` and `/resume` switch the pi session the bridge is attached to; the bridge reconnects automatically
+- `/plain` and `/rich` switch between rich messages and the compatibility path
 
 ## License
 

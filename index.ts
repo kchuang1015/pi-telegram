@@ -16,6 +16,13 @@ interface TelegramConfig {
 	lastUpdateId?: number;
 	/** Set before a session switch so the bridge can resume polling afterwards. */
 	reconnectAfterSessionSwitch?: boolean;
+	/**
+	 * When false, replies are sent with sendMessage + HTML instead of
+	 * sendRichMessage. Telegram Web has known rendering bugs with rich
+	 * messages (Bot API 10.1+), so this can be turned off for compatibility.
+	 * Undefined means "use rich messages".
+	 */
+	richMessages?: boolean;
 }
 
 interface TelegramApiResponse<T> {
@@ -296,6 +303,167 @@ function chunkParagraphs(text: string): string[] {
 	return chunks;
 }
 
+const HTML_ESCAPES: Record<string, string> = { "&": "&amp;", "<": "&lt;", ">": "&gt;" };
+
+export function escapeHtmlText(text: string): string {
+	return text.replace(/[&<>]/g, (ch) => HTML_ESCAPES[ch]);
+}
+
+/** Approximate display width, so CJK table columns line up in monospace blocks. */
+function displayWidth(text: string): number {
+	let width = 0;
+	for (const ch of text) {
+		const code = ch.codePointAt(0) ?? 0;
+		const wide =
+			(code >= 0x1100 && code <= 0x115f) ||
+			(code >= 0x2e80 && code <= 0xa4cf) ||
+			(code >= 0xac00 && code <= 0xd7a3) ||
+			(code >= 0xf900 && code <= 0xfaff) ||
+			(code >= 0xfe30 && code <= 0xfe6f) ||
+			(code >= 0xff00 && code <= 0xff60) ||
+			(code >= 0xffe0 && code <= 0xffe6) ||
+			(code >= 0x1f300 && code <= 0x1f9ff);
+		width += wide ? 2 : 1;
+	}
+	return width;
+}
+
+function splitTableRow(line: string): string[] {
+	return line
+		.trim()
+		.replace(/^\|/, "")
+		.replace(/\|$/, "")
+		.split("|")
+		.map((cell) => cell.trim());
+}
+
+function isTableRow(line: string): boolean {
+	const trimmed = line.trim();
+	return trimmed.startsWith("|") && trimmed.includes("|", 1);
+}
+
+function isTableSeparator(line: string): boolean {
+	const trimmed = line.trim();
+	if (!trimmed.includes("|")) return false;
+	const cells = splitTableRow(trimmed);
+	return cells.length > 0 && cells.every((cell) => /^:?-{2,}:?$/.test(cell));
+}
+
+/** Telegram HTML has no table tag, so tables degrade to an aligned monospace block. */
+function renderTableAsPre(header: string[], body: string[][]): string {
+	const columns = Math.max(header.length, ...body.map((row) => row.length), 0);
+	if (columns === 0) return "";
+	const rows = [header, ...body].map((row) => [
+		...row,
+		...Array(Math.max(0, columns - row.length)).fill(""),
+	]);
+	const widths: number[] = [];
+	for (let column = 0; column < columns; column++) {
+		widths.push(Math.max(1, ...rows.map((row) => displayWidth(row[column] ?? ""))));
+	}
+	const format = (row: string[]): string =>
+		row
+			.map((cell, column) => cell + " ".repeat(Math.max(0, widths[column] - displayWidth(cell))))
+			.join("  ")
+			.trimEnd();
+	const lines = [
+		format(rows[0]),
+		widths.map((width) => "-".repeat(width)).join("  "),
+		...rows.slice(1).map(format),
+	];
+	return lines.join("\n");
+}
+
+function convertInline(text: string): string {
+	const codeSpans: string[] = [];
+	let working = text.replace(/`([^`\n]+)`/g, (_match, code: string) => {
+		codeSpans.push(`<code>${escapeHtmlText(code)}</code>`);
+		return `\u0000${codeSpans.length - 1}\u0000`;
+	});
+	working = escapeHtmlText(working);
+	working = working.replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, (_match, label: string, url: string) => `<a href="${escapeHtmlText(url)}">${label}</a>`);
+	working = working.replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>");
+	working = working.replace(/__([^_\n]+)__/g, "<b>$1</b>");
+	working = working.replace(/~~([^~\n]+)~~/g, "<s>$1</s>");
+	working = working.replace(/(^|[\s(\[])\*([^*\n]+)\*/g, "$1<i>$2</i>");
+	working = working.replace(/(^|[\s(\[])_([^_\n]+)_/g, "$1<i>$2</i>");
+	working = working.replace(/\u0000(\d+)\u0000/g, (_match, index: string) => codeSpans[Number(index)] ?? "");
+	return working;
+}
+
+/**
+ * Convert the markdown subset used in replies into Telegram-flavoured HTML.
+ * Used for the compatibility (non-rich) delivery path, where every client
+ * can render the result.
+ */
+export function markdownToTelegramHtml(markdown: string): string {
+	const lines = markdown.replace(/\r\n/g, "\n").split("\n");
+	const out: string[] = [];
+	let index = 0;
+	while (index < lines.length) {
+		const line = lines[index];
+		const fence = /^\s*```(\w*)\s*$/.exec(line);
+		if (fence) {
+			const language = fence[1];
+			const buffer: string[] = [];
+			index++;
+			while (index < lines.length && !/^\s*```\s*$/.test(lines[index])) {
+				buffer.push(lines[index]);
+				index++;
+			}
+			index++;
+			const classAttribute = language ? ` class="language-${escapeHtmlText(language)}"` : "";
+			out.push(`<pre><code${classAttribute}>${escapeHtmlText(buffer.join("\n"))}</code></pre>`);
+			continue;
+		}
+		if (isTableRow(line) && index + 1 < lines.length && isTableSeparator(lines[index + 1])) {
+			const rows: string[] = [];
+			while (index < lines.length && isTableRow(lines[index])) {
+				rows.push(lines[index]);
+				index++;
+			}
+			const header = splitTableRow(rows[0] ?? "");
+			const body = rows.slice(2).map(splitTableRow);
+			out.push(`<pre>${escapeHtmlText(renderTableAsPre(header, body))}</pre>`);
+			continue;
+		}
+		const heading = /^(#{1,6})\s+(.*)$/.exec(line);
+		if (heading) {
+			out.push(`<b>${convertInline(heading[2])}</b>`);
+			index++;
+			continue;
+		}
+		if (/^\s*([-*_])\s*(\1\s*){2,}$/.test(line)) {
+			out.push("— — —");
+			index++;
+			continue;
+		}
+		if (/^>\s?/.test(line)) {
+			const buffer: string[] = [];
+			while (index < lines.length && /^>\s?/.test(lines[index])) {
+				buffer.push(lines[index].replace(/^>\s?/, ""));
+				index++;
+			}
+			out.push(`<blockquote>${convertInline(buffer.join("\n"))}</blockquote>`);
+			continue;
+		}
+		const listItem = /^(\s*)(?:[-*+]|\d+\.)\s+(.*)$/.exec(line);
+		if (listItem) {
+			out.push(`${listItem[1]}• ${convertInline(listItem[2])}`);
+			index++;
+			continue;
+		}
+		if (!line.trim()) {
+			out.push("");
+			index++;
+			continue;
+		}
+		out.push(convertInline(line));
+		index++;
+	}
+	return out.join("\n");
+}
+
 async function readConfig(): Promise<TelegramConfig> {
 	try {
 		const content = await readFile(CONFIG_PATH, "utf8");
@@ -403,9 +571,11 @@ export default function (pi: ExtensionAPI) {
 	async function sendTextWithFallback(
 		chatId: number,
 		text: string,
-		options?: { signal?: AbortSignal; preferHtml?: boolean; messageId?: number },
+		options?: { signal?: AbortSignal; preferHtml?: boolean; messageId?: number; rich?: boolean },
 	): Promise<TelegramSentMessage> {
 		const { signal, preferHtml = true, messageId } = options ?? {};
+		// Rich messages are opt-out: Telegram Web can fail to render them.
+		const useRich = options?.rich ?? config.richMessages !== false;
 		const method = messageId === undefined ? "sendMessage" : "editMessageText";
 		const target = { chat_id: chatId, ...(messageId === undefined ? {} : { message_id: messageId }) };
 		const request = async (apiMethod: string, payload: Record<string, unknown>): Promise<TelegramSentMessage> => {
@@ -418,19 +588,30 @@ export default function (pi: ExtensionAPI) {
 			}
 		};
 		if (preferHtml) {
-			try {
-				return await request(
-					messageId === undefined ? "sendRichMessage" : "editMessageText",
-					{ ...target, rich_message: { markdown: text }, ...(messageId === undefined ? { allow_paid_broadcast: false } : {}) },
-				);
-			} catch (err) {
-				const description = err instanceof Error ? err.message : String(err);
-				if (!isParseErrorMessage(description) && description !== "Not Found") throw err;
+			if (useRich) {
+				try {
+					if (messageId === undefined) {
+						return await request("sendRichMessage", {
+							...target,
+							rich_message: { markdown: text },
+							allow_paid_broadcast: false,
+						});
+					}
+					// editMessageText has no rich payload: convert to HTML instead.
+					return await request("editMessageText", {
+						...target,
+						text: markdownToTelegramHtml(text),
+						parse_mode: "HTML",
+					});
+				} catch (err) {
+					const description = err instanceof Error ? err.message : String(err);
+					if (!isParseErrorMessage(description) && description !== "Not Found") throw err;
+				}
 			}
 			try {
 				return await request(
 					method,
-					{ ...target, text, parse_mode: "HTML" },
+					{ ...target, text: markdownToTelegramHtml(text), parse_mode: "HTML" },
 				);
 			} catch (err) {
 				const description = err instanceof Error ? err.message : String(err);
@@ -554,13 +735,14 @@ export default function (pi: ExtensionAPI) {
 			const draftId = state.draftId ?? allocateDraftId();
 			state.draftId = draftId;
 			try {
+				// Streamed previews always use the plain path: rich drafts are sent
+				// every few hundred milliseconds and each one is another rich payload
+				// that older web clients can choke on.
 				try {
-					await callTelegram("sendRichMessageDraft", {
-						chat_id: chatId, draft_id: draftId, rich_message: { markdown: truncated },
+					await callTelegram("sendMessageDraft", {
+						chat_id: chatId, draft_id: draftId, text: markdownToTelegramHtml(truncated), parse_mode: "HTML",
 					});
-				} catch (err) {
-					const description = err instanceof Error ? err.message : String(err);
-					if (!isParseErrorMessage(description) && description !== "Not Found") throw err;
+				} catch {
 					await callTelegram("sendMessageDraft", { chat_id: chatId, draft_id: draftId, text: truncated });
 				}
 				draftSupport = "supported";
@@ -879,6 +1061,30 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
+		if (lower === "/plain" || lower === "/plaintext" || lower === "/compat") {
+			config = await readConfig();
+			config.richMessages = false;
+			await writeConfig(config);
+			await sendTextReply(
+				firstMessage.chat.id,
+				firstMessage.message_id,
+				"已切換到相容模式：回覆改用 sendMessage + HTML（表格以等寬字顯示）。Telegram Web 相容性最好。輸入 /rich 可切回原生表格。",
+			);
+			return;
+		}
+
+		if (lower === "/rich" || lower === "/richtext") {
+			config = await readConfig();
+			config.richMessages = true;
+			await writeConfig(config);
+			await sendTextReply(
+				firstMessage.chat.id,
+				firstMessage.message_id,
+				"已切換到 Rich 模式：回覆使用 sendRichMessage（原生表格、標題、摺疊）。輸入 /plain 可切回相容模式。",
+			);
+			return;
+		}
+
 		if (lower === "/compact") {
 			if (!ctx.isIdle()) {
 				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Cannot compact while pi is busy. Send \"stop\" first.");
@@ -979,6 +1185,7 @@ export default function (pi: ExtensionAPI) {
 			} else {
 				lines.push("Context: unknown");
 			}
+			lines.push(`Format: ${config.richMessages === false ? "compat (sendMessage + HTML)" : "rich (sendRichMessage)"}`);
 			if (lines.length === 0) {
 				lines.push("No usage data yet.");
 			}
@@ -990,7 +1197,7 @@ export default function (pi: ExtensionAPI) {
 			await sendTextReply(
 				firstMessage.chat.id,
 				firstMessage.message_id,
-				`Send me a message and I will forward it to pi. Commands: /status, /compact, /new, /resume, stop.`,
+				`Send me a message and I will forward it to pi. Commands: /status, /compact, /new, /resume, /plain, /rich, stop.`,
 			);
 			if (config.allowedUserId === undefined && firstMessage.from) {
 				config.allowedUserId = firstMessage.from.id;
@@ -1160,6 +1367,7 @@ export default function (pi: ExtensionAPI) {
 				`polling: ${pollingPromise ? "running" : "stopped"}`,
 				`active telegram turn: ${activeTelegramTurn ? "yes" : "no"}`,
 				`queued telegram turns: ${queuedTelegramTurns.length}`,
+				`format: ${config.richMessages === false ? "compat" : "rich"}`,
 			];
 			ctx.ui.notify(status.join(" | "), "info");
 		},
