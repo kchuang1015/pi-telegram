@@ -1207,6 +1207,35 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
+		// 插話：回合進行中 → 直接以 steer 交付（下一個工具邊界生效），不排隊等待
+		if (!ctx.isIdle()) {
+			const steerText = messages
+				.map((message) => (message.text || message.caption || "").trim())
+				.filter((text) => text.length > 0)
+				.join("\n");
+			if (steerText) {
+				try {
+					pi.sendUserMessage(steerText, { deliverAs: "steer" });
+					await sendTextReply(
+						firstMessage.chat.id,
+						firstMessage.message_id,
+						"已插入目前工作（steer）：會在下一個工具呼叫結束後生效。",
+					);
+				} catch (error) {
+					await sendTextReply(
+						firstMessage.chat.id,
+						firstMessage.message_id,
+						`插話失敗（已改為排隊）：${String(error)}`,
+					);
+					const historyTurns = preserveQueuedTurnsAsHistory ? queuedTelegramTurns.splice(0) : [];
+					preserveQueuedTurnsAsHistory = false;
+					const turn = await createTelegramTurn(messages, historyTurns);
+					queuedTelegramTurns.push(turn);
+				}
+				return;
+			}
+		}
+
 		const historyTurns = preserveQueuedTurnsAsHistory ? queuedTelegramTurns.splice(0) : [];
 		preserveQueuedTurnsAsHistory = false;
 		const turn = await createTelegramTurn(messages, historyTurns);
