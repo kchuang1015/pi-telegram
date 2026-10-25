@@ -161,6 +161,23 @@ interface TelegramMediaGroupState {
 	flushTimer?: ReturnType<typeof setTimeout>;
 }
 
+/**
+ * Result of a steer delivery attempt.
+ *
+ * `delivered: false` means pi never accepted the message (for example while a
+ * compaction is in progress). The caller must then fall back to the regular
+ * queue and tell the user what actually happened instead of pretending the
+ * steer worked.
+ */
+type SteerOutcome = { delivered: true; mode: "steer" | "newTurn" } | { delivered: false; reason: string };
+
+/** A steer submission waiting for pi to confirm that it entered the prompt pipeline. */
+interface PendingSteerSubmission {
+	text: string;
+	resolve: (outcome: SteerOutcome) => void;
+	timer: ReturnType<typeof setTimeout>;
+}
+
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "telegram.json");
 const TEMP_DIR = join(homedir(), ".pi", "agent", "tmp", "telegram");
 const TELEGRAM_PREFIX = "[telegram]";
@@ -169,6 +186,14 @@ const MAX_ATTACHMENTS_PER_TURN = 10;
 const PREVIEW_THROTTLE_MS = 750;
 const TELEGRAM_DRAFT_ID_MAX = 2_147_483_647;
 const TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS = 1200;
+/**
+ * How long the bridge waits for pi to confirm that a steer message was accepted.
+ *
+ * pi emits the `input` event synchronously inside `prompt()`, so a healthy
+ * steer is confirmed within a few milliseconds. The timeout only fires when pi
+ * dropped the message (compaction in progress, session shutting down, ...).
+ */
+const STEER_CONFIRM_TIMEOUT_MS = 3000;
 
 const SYSTEM_PROMPT_SUFFIX = `
 
@@ -499,6 +524,25 @@ export default function (pi: ExtensionAPI) {
 	let pendingSessionReply: { chatId: number; messageId: number } | undefined;
 	/** Sessions offered for selection by /resume. */
 	let pendingSessionChoices: SessionChoice[] | undefined;
+	/**
+	 * Steer submissions waiting for pi's confirmation.
+	 *
+	 * `pi.sendUserMessage()` returns void and pi swallows delivery failures
+	 * (they are routed to the extension error channel), so the bridge cannot
+	 * observe a failed steer through the return value. The `input` event is the
+	 * only reliable signal that a message actually entered pi's prompt pipeline.
+	 */
+	const pendingSteerSubmissions: PendingSteerSubmission[] = [];
+	/** Callbacks waiting for the next agent run to start. */
+	const pendingRunStartCallbacks: Array<() => void> = [];
+	/**
+	 * Texts of queued turns this bridge has handed to pi.
+	 *
+	 * Those turns also produce an `input` event; without this list a queued turn
+	 * whose text happens to contain the steer text could be mistaken for the
+	 * steer confirmation.
+	 */
+	const pendingOwnDeliveries: string[] = [];
 
 	function allocateDraftId(): number {
 		nextDraftId = nextDraftId >= TELEGRAM_DRAFT_ID_MAX ? 1 : nextDraftId + 1;
@@ -1041,6 +1085,132 @@ export default function (pi: ExtensionAPI) {
 		return `Recent sessions:\n${lines.join("\n")}\n\nReply with a number to switch.`;
 	}
 
+	/**
+	 * Wait for the next agent run to start.
+	 *
+	 * A steer is confirmed by pi's `input` event. A message that was handed over
+	 * after the running turn had already ended starts a *new* run instead, and for
+	 * that case only the run start proves that pi really took the message.
+	 */
+	function watchForAgentRunStart(timeoutMs: number): { promise: Promise<boolean>; cancel: () => void } {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		let settled = false;
+		let settle: (started: boolean) => void = () => {};
+		const promise = new Promise<boolean>((resolve) => {
+			settle = resolve;
+		});
+		const onStart = () => {
+			if (settled) return;
+			settled = true;
+			if (timer) clearTimeout(timer);
+			settle(true);
+		};
+		timer = setTimeout(() => {
+			if (settled) return;
+			settled = true;
+			const index = pendingRunStartCallbacks.indexOf(onStart);
+			if (index !== -1) pendingRunStartCallbacks.splice(index, 1);
+			settle(false);
+		}, timeoutMs);
+		pendingRunStartCallbacks.push(onStart);
+		return {
+			promise,
+			cancel: () => {
+				if (settled) return;
+				settled = true;
+				if (timer) clearTimeout(timer);
+				const index = pendingRunStartCallbacks.indexOf(onStart);
+				if (index !== -1) pendingRunStartCallbacks.splice(index, 1);
+			},
+		};
+	}
+
+	/**
+	 * Deliver a mid-turn message to pi as a steer and wait until pi confirms it.
+	 *
+	 * `pi.sendUserMessage()` is fire-and-forget: it returns `void` and pi routes
+	 * any delivery error to the extension error channel, so a `try/catch` around
+	 * it can never see a failed steer. The `input` event is emitted by pi only
+	 * after the message passed every guard (compaction check, input handlers) and
+	 * is about to be queued, so it is used as the delivery confirmation.
+	 *
+	 * Returns `delivered: false` when pi never accepted the message; the caller
+	 * has to fall back to the regular queue and report the failure honestly.
+	 */
+	async function deliverSteerMessage(text: string): Promise<SteerOutcome> {
+		// Registered before the send: a message handed over after the turn ended
+		// starts a new run, and the run start is the only proof that pi took it.
+		const runStart = watchForAgentRunStart(STEER_CONFIRM_TIMEOUT_MS);
+		const outcome = await new Promise<SteerOutcome>((resolve) => {
+			const submission: PendingSteerSubmission = {
+				text,
+				resolve,
+				timer: setTimeout(() => {
+					const index = pendingSteerSubmissions.indexOf(submission);
+					if (index !== -1) pendingSteerSubmissions.splice(index, 1);
+					resolve({ delivered: false, reason: "pi 未確認接收（逾時）" });
+				}, STEER_CONFIRM_TIMEOUT_MS),
+			};
+			pendingSteerSubmissions.push(submission);
+			try {
+				pi.sendUserMessage(text, { deliverAs: "steer" });
+			} catch (error) {
+				clearTimeout(submission.timer);
+				const index = pendingSteerSubmissions.indexOf(submission);
+				if (index !== -1) pendingSteerSubmissions.splice(index, 1);
+				resolve({ delivered: false, reason: error instanceof Error ? error.message : String(error) });
+			}
+		});
+		if (!outcome.delivered) {
+			runStart.cancel();
+			return outcome;
+		}
+		if (outcome.mode === "newTurn") {
+			// pi treated the message as a new prompt: only accept it once a run
+			// actually started, otherwise the message was dropped by pi.
+			const started = await runStart.promise;
+			if (!started) return { delivered: false, reason: "pi 沒有啟動新的回合" };
+		} else {
+			runStart.cancel();
+		}
+		return outcome;
+	}
+
+	/**
+	 * Hand a queued Telegram turn to pi.
+	 *
+	 * The text is remembered so that the `input` event of this own delivery is
+	 * not mistaken for the confirmation of a steer.
+	 */
+	function sendQueuedTurnToPi(turn: PendingTelegramTurn): void {
+		pendingOwnDeliveries.push(queuedTurnText(turn));
+		if (pendingOwnDeliveries.length > 10) pendingOwnDeliveries.shift();
+		pi.sendUserMessage(turn.content, { deliverAs: "followUp" });
+	}
+
+	/** The prompt text of a queued turn (pi joins the text parts with "\n"). */
+	function queuedTurnText(turn: PendingTelegramTurn): string {
+		return turn.content
+			.filter((part): part is TextContent => part.type === "text")
+			.map((part) => part.text)
+			.join("\n");
+	}
+
+	/**
+	 * Hand the next queued Telegram turn to pi.
+	 *
+	 * Used when a run ends: the queued turn becomes the next run. Keeping this in
+	 * one place makes sure the queue is drained even when the finished run was
+	 * not started by the bridge.
+	 */
+	function deliverNextQueuedTurn(ctx: ExtensionContext): void {
+		if (queuedTelegramTurns.length === 0 || preserveQueuedTurnsAsHistory) return;
+		const nextTurn = queuedTelegramTurns[0];
+		startTypingLoop(ctx, nextTurn.chatId);
+		updateStatus(ctx);
+		sendQueuedTurnToPi(nextTurn);
+	}
+
 	async function dispatchAuthorizedTelegramMessages(messages: TelegramMessage[], ctx: ExtensionContext): Promise<void> {
 		const firstMessage = messages[0];
 		if (!firstMessage) return;
@@ -1213,24 +1383,43 @@ export default function (pi: ExtensionAPI) {
 				.map((message) => (message.text || message.caption || "").trim())
 				.filter((text) => text.length > 0)
 				.join("\n");
-			if (steerText) {
-				try {
-					pi.sendUserMessage(steerText, { deliverAs: "steer" });
-					await sendTextReply(
-						firstMessage.chat.id,
-						firstMessage.message_id,
-						"已插入目前工作（steer）：會在下一個工具呼叫結束後生效。",
-					);
-				} catch (error) {
-					await sendTextReply(
-						firstMessage.chat.id,
-						firstMessage.message_id,
-						`插話失敗（已改為排隊）：${String(error)}`,
-					);
-					const historyTurns = preserveQueuedTurnsAsHistory ? queuedTelegramTurns.splice(0) : [];
-					preserveQueuedTurnsAsHistory = false;
-					const turn = await createTelegramTurn(messages, historyTurns);
-					queuedTelegramTurns.push(turn);
+			// 回合可能剛好在這幾行之間結束；那時就不該走插話，改走一般的排隊路徑。
+			if (steerText && !ctx.isIdle()) {
+				// pi.sendUserMessage() 不會拋錯也沒有回傳值，投遞失敗只會出現在 pi 的
+				// extension error 通道（Mark 在 Telegram 看不到）。因此送出後必須等 pi 的
+				// `input` 事件確認真的有收到，否則不能回「已插入」這種假確認。
+				const outcome = await deliverSteerMessage(steerText);
+				if (outcome.delivered) {
+					if (outcome.mode === "steer") {
+						await sendTextReply(
+							firstMessage.chat.id,
+							firstMessage.message_id,
+							"已插入目前工作（steer）：會在下一個工具呼叫結束後生效。",
+						);
+					} else {
+						await sendTextReply(
+							firstMessage.chat.id,
+							firstMessage.message_id,
+							"插話送出時上一回合剛好結束：訊息已直接作為新的一輪送出（不是插話）。",
+						);
+					}
+					return;
+				}
+				// 插話真的沒送到 → 誠實回報，並退回排隊（不要讓訊息消失）。
+				await sendTextReply(
+					firstMessage.chat.id,
+					firstMessage.message_id,
+					`插話未送達（${outcome.reason}），已改為排隊：會在目前回合結束後執行。`,
+				);
+				const historyTurns = preserveQueuedTurnsAsHistory ? queuedTelegramTurns.splice(0) : [];
+				preserveQueuedTurnsAsHistory = false;
+				const turn = await createTelegramTurn(messages, historyTurns);
+				queuedTelegramTurns.push(turn);
+				if (ctx.isIdle()) {
+					// 等待確認期間回合就結束了：立刻送出，否則這則訊息會卡在佇列裡。
+					startTypingLoop(ctx, turn.chatId);
+					updateStatus(ctx);
+					sendQueuedTurnToPi(turn);
 				}
 				return;
 			}
@@ -1243,7 +1432,7 @@ export default function (pi: ExtensionAPI) {
 		if (ctx.isIdle()) {
 			startTypingLoop(ctx, turn.chatId);
 			updateStatus(ctx);
-			pi.sendUserMessage(turn.content, { deliverAs: "followUp" });
+			sendQueuedTurnToPi(turn);
 		}
 	}
 
@@ -1505,6 +1694,12 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", async (_event, _ctx) => {
 		shouldResumePolling = pollingPromise !== undefined;
 		queuedTelegramTurns = [];
+		pendingOwnDeliveries.length = 0;
+		for (const submission of pendingSteerSubmissions.splice(0)) {
+			clearTimeout(submission.timer);
+			submission.resolve({ delivered: false, reason: "session 已關閉" });
+		}
+		for (const callback of pendingRunStartCallbacks.splice(0)) callback();
 		for (const state of mediaGroups.values()) {
 			if (state.flushTimer) clearTimeout(state.flushTimer);
 		}
@@ -1518,6 +1713,26 @@ export default function (pi: ExtensionAPI) {
 		await stopPolling();
 	});
 
+	pi.on("input", (event) => {
+		if (event.source !== "extension") return;
+		const ownIndex = pendingOwnDeliveries.indexOf(event.text);
+		if (ownIndex !== -1) {
+			// This is one of our own queued turns, not a steer.
+			pendingOwnDeliveries.splice(ownIndex, 1);
+			return;
+		}
+		const index = pendingSteerSubmissions.findIndex(
+			(submission) => event.text === submission.text || event.text.includes(submission.text),
+		);
+		if (index === -1) return;
+		const [submission] = pendingSteerSubmissions.splice(index, 1);
+		clearTimeout(submission.timer);
+		// `streamingBehavior` is only set while the agent is streaming. When it is
+		// undefined the turn ended before the steer was handed over and pi started
+		// a fresh run with the message instead of steering the running one.
+		submission.resolve({ delivered: true, mode: event.streamingBehavior === "steer" ? "steer" : "newTurn" });
+	});
+
 	pi.on("before_agent_start", async (event) => {
 		const suffix = isTelegramPrompt(event.prompt)
 			? `${SYSTEM_PROMPT_SUFFIX}\n- The current user message came from Telegram.`
@@ -1529,6 +1744,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("agent_start", async (_event, ctx) => {
 		currentAbort = () => ctx.abort();
+		for (const callback of pendingRunStartCallbacks.splice(0)) callback();
 		if (!activeTelegramTurn && queuedTelegramTurns.length > 0) {
 			const nextTurn = queuedTelegramTurns.shift();
 			if (nextTurn) {
@@ -1563,7 +1779,12 @@ export default function (pi: ExtensionAPI) {
 		stopTypingLoop();
 		activeTelegramTurn = undefined;
 		updateStatus(ctx);
-		if (!turn) return;
+		if (!turn) {
+			// 這一回合不是 bridge 發起的（例如 Mark 從終端機啟動），但佇列裡可能還有
+			// Telegram 的訊息等著執行；不能因為沒有 activeTelegramTurn 就把它們卡住。
+			deliverNextQueuedTurn(ctx);
+			return;
+		}
 
 		const assistant = extractAssistantText(event.messages);
 		if (assistant.stopReason === "aborted") {
@@ -1620,10 +1841,7 @@ export default function (pi: ExtensionAPI) {
 		await sendQueuedAttachments(turn);
 
 		if (queuedTelegramTurns.length > 0 && !preserveQueuedTurnsAsHistory) {
-			const nextTurn = queuedTelegramTurns[0];
-			startTypingLoop(ctx, nextTurn.chatId);
-			updateStatus(ctx);
-			pi.sendUserMessage(nextTurn.content, { deliverAs: "followUp" });
+			deliverNextQueuedTurn(ctx);
 		}
 	});
 }
